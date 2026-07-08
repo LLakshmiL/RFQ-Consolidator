@@ -6,6 +6,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 *.egg-info/
 .venv/
 venv/
@@ -13,6 +14,12 @@ env/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code
+.claude/settings.local.json
+
+# Output
+output/
 
 # IDE / OS
 .vscode/

@@ -1,0 +1,52 @@
+{
+  "origin_country": { "aliases": ["1 Origin Country [ISO country code]"] },
+  "origin_place": { "aliases": ["2 Place/Zone of Origin"] },
+  "port_of_loading": { "aliases": ["3 Port of Loading [Name] or Port Grouping"] },
+  "port_of_destination": { "aliases": ["5 Port of Destination [Name] or Port Grouping"] },
+  "destination_country": { "aliases": ["7 Destination Country [ISO country code]"] },
+  "destination_place": { "aliases": ["8 Place/Zone of Destination"] },
+  "service_type": { "aliases": ["9 Type of service"] },
+  "bulkiness_cbm_to_ton": { "aliases": ["11 Bulkiness (cbm only): 1 cbm = x ton"] },
+  "service_mode": { "aliases": ["12 Service Mode (Door to Door, Door to Port,....)"] },
+  "volume_cbm_annual": { "aliases": ["14 No. Of Cbm [1 Year Volume]"] },
+
+  "pre_carriage_rate": { "aliases": ["17 Pre-carriage rate"] },
+  "pre_carriage_currency": { "aliases": ["17 Currency"] },
+  "pre_carriage_mode": { "aliases": ["17 Mode of Transportation (Pre-Carriage) e.g. Barge, Rail, Truck"] },
+
+  "export_customs_clearance_fee": { "aliases": ["19 Export Customs Clearance (where applicable and requested)"] },
+  "export_customs_clearance_currency": { "aliases": ["19 Currency"] },
+
+  "consolidation_fee": { "aliases": ["Consolidation Fee (incl. Transport to Port)"] },
+  "consolidation_fee_currency": { "aliases": ["Currency"], "after": "consolidation_fee" },
+
+  "port_origin_surcharge": { "aliases": ["20 Port Origin Surcharge"] },
+  "port_origin_surcharge_currency": { "aliases": ["20 Currency"] },
+
+  "main_carriage_rate": { "aliases": ["21 Main Carriage Rate"] },
+  "main_carriage_special_surcharges": { "aliases": ["Special Surcharges"] },
+  "main_carriage_currency": { "aliases": ["21 Currency"] },
+
+  "port_destination_surcharge": { "aliases": ["22 Port Destination Surcharge"] },
+  "port_destination_surcharge_currency": { "aliases": ["22 Currency"] },
+
+  "demurrage_free_days": { "aliases": ["23 Demurrage - Number of days free of charge"] },
+  "demurrage_cost": { "aliases": ["24 Demurrage Cost after allowed free-time"] },
+  "demurrage_currency": { "aliases": ["24 Currency"] },
+
+  "import_customs_clearance_fee": { "aliases": ["26 Import Customs Clearance (where applicable and requested)"] },
+  "import_customs_clearance_currency": { "aliases": ["26 Currency"] },
+
+  "deconsolidation_fee": { "aliases": ["Deconsolidation Fee (incl. Transport to Decons. Center)"] },
+  "deconsolidation_fee_currency": { "aliases": ["Currency"], "after": "deconsolidation_fee" },
+
+  "on_carriage_rate": { "aliases": ["27 On-Carriage Rate"] },
+  "on_carriage_currency": { "aliases": ["27 Currency"] },
+  "on_carriage_mode": { "aliases": ["27 Preferred Mode of Transport (On-Carriage) e.g. Barge, Rail, Truck"] },
+
+  "detention_free_days": { "aliases": ["28 Detention - Number of days free of charge"] },
+  "detention_cost": { "aliases": ["28 Detention Cost after allowed free time (incl. Port Charge and other Cost)"] },
+  "detention_currency": { "aliases": ["28 Currency"] },
+
+  "total_transit_time_days": { "aliases": ["36.1 Total Transit Time [days]"] }
+}

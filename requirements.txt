@@ -1,0 +1,8 @@
+pandas>=3.0
+openpyxl>=3.1
+
+# webapp/app.py (Flask UI)
+flask>=3.1
+
+# webapp/streamlit_app.py (Streamlit UI)
+streamlit>=1.59
