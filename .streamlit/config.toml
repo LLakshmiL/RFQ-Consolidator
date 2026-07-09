@@ -1,5 +1,13 @@
+[theme]
+primaryColor = "#2E1CB8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F3FB"
+textColor = "#12123A"
+font = "sans serif"
+
 [server]
 address = "localhost"
+maxUploadSize = 200
 
 [browser]
 gatherUsageStats = false

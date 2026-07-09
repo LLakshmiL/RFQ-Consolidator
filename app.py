@@ -23,6 +23,7 @@ import re
 from collections import Counter
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import openpyxl
@@ -32,17 +33,65 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
+# ==================== BACKEND CONFIG ====================
+# These were previously sidebar controls. They are now fixed defaults —
+# edit the values here if the behavior ever needs to change.
+
+# Merge headers that differ only by a leading numeric outline (4.19 / 4.20).
+STRIP_NUMBER_PREFIX = True
+
+# Drop satellite columns (Quantity, Currency, …) that are blank/zero across
+# every row. Kept OFF so every satellite column is preserved in the output.
+DROP_EMPTY_QUANTITY = False
+
+# Sheet-name prefixes to skip (hidden helper sheets like 'Formulas_…').
+SKIP_SHEET_PREFIXES = ["formulas_"]
+
+# Alias groups: each inner list is one field; the first entry is canonical.
+# Every alias in a group is matched to the first. Example:
+#   ["Port of Loading", "POL", "Loading Port"]
+ALIAS_GROUPS = [
+    # ["4.20 E-Mail address", "4.19 E-Mail address", "4.18 E-Mail address"],
+]
+
+# Write to cells on protected sheets. The tender template protects the
+# region tabs, so this must be True for edits to actually land.
+IGNORE_PROTECTION = True
+# ========================================================
+
+
+def _build_alias_text() -> str:
+    """Render ALIAS_GROUPS into the '|'-separated form parse_aliases expects."""
+    return "\n".join(" | ".join(group) for group in ALIAS_GROUPS if len(group) >= 2)
+
+
 # ---------------- Header normalization / matching by meaning ----------------
 
-def norm(s: str) -> str:
-    """Canonical form of a header — case/whitespace/punctuation-agnostic."""
-    s = str(s or "").lower()
+# Leading outline number followed by whitespace: '4.19 ', '2.3.1 ', or a
+# plain integer like '17 '. Requiring trailing whitespace avoids eating the
+# number in tokens like '20ft'.
+_NUM_PREFIX = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+
+
+def strip_number_prefix(s: str) -> str:
+    """Remove leading numeric outline like '4.19 ', '2.3.1 ' or '17 '."""
+    return _NUM_PREFIX.sub("", str(s or "")).strip()
+
+
+def norm(s: str, strip_prefix: bool = False) -> str:
+    """Canonical form of a header — case/whitespace/punctuation-agnostic.
+    If strip_prefix=True, leading numeric outline is dropped first, so
+    '4.19 E-Mail address' and '4.20 E-Mail address' collapse to the same key."""
+    s = str(s or "")
+    if strip_prefix:
+        s = strip_number_prefix(s)
+    s = s.lower()
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def parse_aliases(text: str) -> dict:
+def parse_aliases(text: str, strip_prefix: bool = False) -> dict:
     """Parse alias groups: one group per line, '|'-separated.
     Returns {norm(any_alias): norm(first_alias_in_group)}."""
     out = {}
@@ -50,15 +99,27 @@ def parse_aliases(text: str) -> dict:
         parts = [p.strip() for p in line.split("|") if p.strip()]
         if len(parts) < 2:
             continue
-        canonical = norm(parts[0])
+        canonical_key = norm(parts[0], strip_prefix)
         for p in parts:
-            out[norm(p)] = canonical
+            out[norm(p, strip_prefix)] = canonical_key
     return out
 
 
-def canonical(header: str, aliases: dict) -> str:
-    n = norm(header)
+def canonical(header: str, aliases: dict, strip_prefix: bool = False) -> str:
+    n = norm(header, strip_prefix)
     return aliases.get(n, n)
+
+
+# Separator used to attach a satellite/qualifier column (Quantity, Currency,
+# UOM, …) to the primary column it belongs to: "Main Carriage — Quantity".
+SAT_SEP = " — "
+
+
+def _satellite_key(value) -> str:
+    """Normalized key for satellite detection: drop the leading number
+    outline and casefold, so '17 Currency', '19 Currency' and bare
+    'Currency' all reduce to the same key."""
+    return strip_number_prefix(value).strip().casefold()
 
 
 # ---------------- Reading sheets with cell coordinates ----------------
@@ -72,26 +133,63 @@ def detect_header_row(ws, scan_rows: int = 40) -> int:
     return best_row
 
 
-def read_sheet_with_coords(ws, aliases: dict):
+def detect_satellite_labels(wb, skip_prefixes, min_repeat: int = 2) -> set:
+    """Return the set of satellite labels for a workbook.
+
+    A satellite is any header label that repeats within a sheet's header row
+    (e.g. 'Quantity' after every cost line, 'Currency' after every rate).
+    Such a column has no standalone meaning — it qualifies the column to its
+    left. Detection is global: a label that repeats on ANY sheet is treated
+    as a satellite on EVERY sheet, so a lone occurrence on one tab is still
+    qualified consistently instead of colliding with a real column elsewhere.
+    """
+    satellites = set()
+    for name in wb.sheetnames:
+        if any(name.lower().startswith(p) for p in skip_prefixes):
+            continue
+        ws = wb[name]
+        hdr = detect_header_row(ws)
+        keys = [_satellite_key(c.value) for c in ws[hdr]
+                if c.value is not None and str(c.value).strip()]
+        for key, count in Counter(keys).items():
+            if key and count >= min_repeat:
+                satellites.add(key)
+    return satellites
+
+
+def read_sheet_with_coords(ws, aliases: dict, strip_prefix: bool = False,
+                           satellite_labels: set = None):
     """Return (display_by_canonical, rows).
     - display_by_canonical: {canonical_key: nice display header seen first}
     - rows: list of {canonical_key: (value, coord_str)} for each data row.
       coord_str format: 'SheetName!A5'
-    Bare 'Quantity' columns are prefixed with the preceding descriptive
-    header — that's how the source expresses the field's meaning.
+
+    Any header whose label is in `satellite_labels` (e.g. 'Quantity',
+    'Currency') is treated as a satellite: it is renamed to
+    '<preceding primary> — <satellite>' so it stays distinct from other
+    satellites of the same type and lines up with the matching satellite on
+    other sheets. If strip_prefix is on, the primary's leading number outline
+    is dropped so renumbered siblings across tabs collapse together.
     """
+    satellite_labels = satellite_labels or set()
     hdr_row = detect_header_row(ws)
     raw = [(str(c.value).strip() if c.value is not None else "") for c in ws[hdr_row]]
 
     display_headers, last_desc = [], ""
     for h in raw:
-        if h and h.lower() != "quantity":
+        if not h:
+            display_headers.append("")
+        elif _satellite_key(h) in satellite_labels:
+            # Satellite column — qualify with the preceding primary header.
+            sat_label = strip_number_prefix(h).strip() or h  # e.g. "Currency"
+            if last_desc:
+                qualifier = strip_number_prefix(last_desc) if strip_prefix else last_desc
+                display_headers.append(f"{qualifier}{SAT_SEP}{sat_label}")
+            else:
+                display_headers.append(sat_label)
+        else:
             last_desc = h
             display_headers.append(h)
-        elif h.lower() == "quantity":
-            display_headers.append(f"{last_desc} — Quantity" if last_desc else "Quantity")
-        else:
-            display_headers.append("")
 
     display_by_canonical: dict = {}
     canon_by_col: list = []
@@ -99,7 +197,7 @@ def read_sheet_with_coords(ws, aliases: dict):
         if not h:
             canon_by_col.append(None)
             continue
-        c = canonical(h, aliases)
+        c = canonical(h, aliases, strip_prefix)
         canon_by_col.append(c)
         display_by_canonical.setdefault(c, h)
 
@@ -125,14 +223,34 @@ def read_sheet_with_coords(ws, aliases: dict):
 
 # ---------------- Consolidation ----------------
 
-def consolidate(file_bytes: bytes, skip_prefixes: list, aliases: dict):
+def _is_empty_satellite(v) -> bool:
+    """A satellite cell (Quantity, Currency, …) counts as empty when blank
+    or zero."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    if s == "" or s.lower() == "none":
+        return True
+    try:
+        return float(s) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def consolidate(file_bytes: bytes, skip_prefixes: list, aliases: dict,
+                strip_prefix: bool = False, drop_empty_quantity: bool = True):
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
 
+    # Pass 1 — find satellite labels (repeating headers) across the workbook.
+    satellite_labels = detect_satellite_labels(wb, skip_prefixes)
+
+    # Pass 2 — read each sheet, qualifying its satellite columns.
     per_sheet: dict = {}
     for name in wb.sheetnames:
         if any(name.lower().startswith(p) for p in skip_prefixes):
             continue
-        display_map, rows = read_sheet_with_coords(wb[name], aliases)
+        display_map, rows = read_sheet_with_coords(
+            wb[name], aliases, strip_prefix, satellite_labels)
         if display_map and rows:
             per_sheet[name] = (display_map, rows)
 
@@ -194,12 +312,36 @@ def consolidate(file_bytes: bytes, skip_prefixes: list, aliases: dict):
     df = pd.DataFrame(data_records, columns=cols)
     coords = pd.DataFrame(coord_records, columns=cols)
 
+    # Drop satellite columns (Quantity, Currency, …) that have no real data
+    # anywhere. The source templates pair a satellite with every descriptive
+    # field, even ones where it is meaningless (e.g. a Quantity after an
+    # E-Mail address). Keeping empty satellites just clutters the view;
+    # dropping them is safe because there is nothing to write back for a
+    # column that was never populated.
+    dropped_empty_qty = []
+    if drop_empty_quantity:
+        for col in display_cols:
+            if SAT_SEP not in col:  # only satellites carry the separator
+                continue
+            if all(_is_empty_satellite(v) for v in df[col]):
+                dropped_empty_qty.append(col)
+        if dropped_empty_qty:
+            df = df.drop(columns=dropped_empty_qty)
+            coords = coords.drop(columns=dropped_empty_qty)
+            for c in dropped_empty_qty:
+                canon = display_to_canon.pop(c, None)
+                if canon and canon in ordered_canon:
+                    ordered_canon.remove(canon)
+            display_cols = [c for c in display_cols if c not in dropped_empty_qty]
+
     meta = {
         "sheets": n,
         "sheet_names": list(per_sheet.keys()),
         "canon_freq": canon_freq,
         "kept_canonicals": ordered_canon,
         "dropped_canonicals": [],
+        "dropped_empty_qty": dropped_empty_qty,
+        "satellite_labels": sorted(satellite_labels),
         "display_to_canon": display_to_canon,
         "canon_to_display_all": {c: [] for c in canon_freq},
     }
@@ -413,12 +555,120 @@ def write_consolidated_sheet(wb, df: pd.DataFrame):
 
 # ---------------- Streamlit UI ----------------
 
-st.set_page_config(page_title="Excel Tab Consolidator", page_icon="📊", layout="wide")
-st.title("📊 Excel Tab Consolidator")
-st.caption(
-    "Three-button workflow: **Consolidate → Merge (dry run) → Write Back**. "
-    "Edits are written back to the exact source cell via stored coordinates. "
-    "The Merge step is mandatory — it catches ORPHANs before anything is saved."
+st.set_page_config(
+    page_title="GEODIS · RFQ Consolidator",
+    page_icon="Geodis Logo.webp" if Path("Geodis Logo.webp").exists() else None,
+    layout="wide",
+)
+
+# ---------------- Brand styling ----------------
+BRAND = "#2E1CB8"
+BRAND_DARK = "#1D138A"
+BRAND_TINT = "#F4F3FB"
+INK = "#12123A"
+
+st.markdown(f"""
+<style>
+    /* Buttons */
+    .stButton > button {{
+        border-radius: 8px;
+        font-weight: 600;
+        transition: all 0.15s ease;
+    }}
+    .stButton > button[kind="primary"] {{
+        background-color: {BRAND};
+        border-color: {BRAND};
+    }}
+    .stButton > button[kind="primary"]:hover:not(:disabled) {{
+        background-color: {BRAND_DARK};
+        border-color: {BRAND_DARK};
+    }}
+    .stDownloadButton > button {{
+        border-radius: 8px;
+        font-weight: 600;
+    }}
+    /* Metric cards */
+    div[data-testid="stMetric"] {{
+        background-color: {BRAND_TINT};
+        border-left: 4px solid {BRAND};
+        padding: 12px 16px;
+        border-radius: 6px;
+    }}
+    /* Section header line */
+    h2, h3 {{
+        border-bottom: 1px solid #E5E4F0;
+        padding-bottom: 6px;
+        margin-top: 1.5rem !important;
+    }}
+    /* Step badge */
+    .step-badge {{
+        display: inline-block;
+        background: {BRAND};
+        color: white;
+        border-radius: 999px;
+        width: 26px;
+        height: 26px;
+        text-align: center;
+        line-height: 26px;
+        font-weight: 700;
+        margin-right: 8px;
+        font-size: 14px;
+    }}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------- Header ----------------
+_logo_candidates = ["Geodis Logo.webp", "geodis_logo.webp", "geodis_logo.png",
+                    "geodis_logo.jpg", "geodis_logo.svg", "logo.png"]
+_logo_path = next((p for p in _logo_candidates if Path(p).exists()), None)
+
+hdr_cols = st.columns([1, 5], vertical_alignment="center")
+with hdr_cols[0]:
+    if _logo_path:
+        st.image(_logo_path, width=190)
+with hdr_cols[1]:
+    st.markdown(
+        f"<h1 style='color:{INK};margin:0;'>RFQ Consolidator</h1>",
+        unsafe_allow_html=True,
+    )
+
+# ---------------- How it works ----------------
+with st.expander("**How it works — read this before your first run**", expanded=False):
+    st.markdown(f"""
+### The 3-step workflow
+
+<span class='step-badge'>1</span> **Consolidate** — Reads every region tab of your uploaded workbook and produces one big table where the same field from different tabs sits in one column. Every consolidated cell remembers its exact source (sheet + row + column).
+
+<span class='step-badge'>2</span> **Merge (dry run)** — Compares your edits against the source. Writes **nothing**. Produces a plan showing exactly which cells will change, plus any `ORPHAN` rows (values typed in a column that doesn't exist on the source tab for that row). *Optional but recommended — it catches "value in the wrong column" mistakes before they're saved.*
+
+<span class='step-badge'>3</span> **Write Back** — Pushes your edits into the source tabs. Changed cells are highlighted **yellow** so you can see what was updated. Downloads the updated workbook + a full audit log.
+
+### Two ways to edit
+
+- **Inline (Option A)**: edit cells directly in the table shown in this page. Simplest for small changes.
+- **Excel round-trip (Option B)**: download the consolidated file, edit it in Excel, then re-upload. Best for many changes or when you want to use Excel's find/replace, filters, etc.
+
+### Rules you should know
+
+- **Empty cell = leave source unchanged.** Deleting a value in the consolidated view will *never* clear the source cell.
+- **Do not add or delete rows/columns** in the consolidated view — Merge and Write Back will BLOCK if the shape changes.
+- **Protected source sheets** are skipped by default. Tick *"Ignore sheet protection"* in the sidebar Advanced section if you own the workbook.
+- **Formulas in source cells are never overwritten.**
+- Always **download the backup** before Write Back — that action cannot be undone by the app.
+""", unsafe_allow_html=True)
+
+# ---- Workflow summary (centered, under "How it works") ----
+st.markdown(
+    f"""
+    <div style='text-align:center; margin: 18px 0 8px;'>
+        <h3 style='color:{INK}; margin:0; border:none;'>Consolidate → Edit → Merge → Write Back</h3>
+        <p style='color:{INK}; opacity:0.65; font-size:14px; margin:6px 0 0;'>
+            Click <strong>Consolidate</strong> first. Then edit inline or via Excel.
+            <strong>Merge</strong> previews changes safely; <strong>Write Back</strong> commits them.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 ss = st.session_state
@@ -430,42 +680,26 @@ for k, default in [
 ]:
     ss.setdefault(k, default)
 
-with st.sidebar:
-    st.header("Matching")
-    st.caption("All headers found across sheets are kept. Use alias groups below to treat differently-labeled fields as the same.")
-
-    with st.expander("Alias groups (match by meaning)"):
-        st.caption(
-            "One group per line, '|'-separated. First entry is the canonical label.\n\n"
-            "Example: `Port of Loading | POL | Loading Port`"
-        )
-        alias_text = st.text_area("Aliases", value="", height=100, label_visibility="collapsed")
-    aliases = parse_aliases(alias_text)
-
-    with st.expander("Advanced"):
-        skip_input = st.text_input(
-            "Skip sheets whose name starts with",
-            value="formulas_",
-            help=(
-                "Excel sometimes stores hidden helper sheets (e.g. shared formulas or "
-                "data-validation lookups) with auto-generated names starting with "
-                "'Formulas_'. This filter hides them from consolidation. Comma-separate "
-                "multiple prefixes."
-            ),
-        )
-        ignore_protection = st.checkbox(
-            "Ignore sheet protection (I own the source)",
-            value=False,
-            help="If unchecked, cells on protected sheets are skipped and reported.",
-        )
-    skip_prefixes = [p.strip().lower() for p in skip_input.split(",") if p.strip()]
-
-    # Blank cells always mean "leave unchanged" — never clear the source.
-    blank_policy = "Leave unchanged"
+# ---- Backend settings (no UI — configured at top of file) ----
+strip_prefix = STRIP_NUMBER_PREFIX
+drop_empty_qty = DROP_EMPTY_QUANTITY
+skip_prefixes = [p.strip().lower() for p in SKIP_SHEET_PREFIXES if p.strip()]
+aliases = parse_aliases(_build_alias_text(), strip_prefix)
+ignore_protection = IGNORE_PROTECTION
+# Blank cells always mean "leave unchanged" — never clear the source.
+blank_policy = "Leave unchanged"
 
 
 # ---- Upload ----
-uploaded = st.file_uploader("Upload Excel file (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
+st.markdown(
+    "<h3>Upload RFQ file</h3>",
+    unsafe_allow_html=True,
+)
+uploaded = st.file_uploader(
+    "Drag and drop your .xlsx / .xlsm file here",
+    type=["xlsx", "xlsm"],
+    label_visibility="collapsed",
+)
 if uploaded:
     if ss.file_name != uploaded.name or ss.file_bytes != uploaded.getvalue():
         ss.file_bytes = uploaded.getvalue()
@@ -474,14 +708,6 @@ if uploaded:
         ss.planned = ss.shape_sig = ss.output_bytes = None
         ss.committed = False
     st.success(f"Loaded **{uploaded.name}** ({len(ss.file_bytes)/1024:.1f} KB)")
-
-    # Always-visible backup download for the pre-edit workbook.
-    st.download_button(
-        "⬇️ Download backup of original workbook",
-        data=ss.file_bytes,
-        file_name=ss.file_name.replace(".xlsx", "_BACKUP.xlsx").replace(".xlsm", "_BACKUP.xlsm"),
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 # ---- Three buttons ----
 if ss.file_bytes:
@@ -498,7 +724,8 @@ if ss.file_bytes:
     # ---- Button 1: Consolidate ----
     if do_consolidate:
         with st.spinner("Reading tabs…"):
-            result, err = consolidate(ss.file_bytes, skip_prefixes, aliases)
+            result, err = consolidate(ss.file_bytes, skip_prefixes, aliases,
+                                       strip_prefix, drop_empty_qty)
         if err:
             st.error(err)
         else:
@@ -528,10 +755,28 @@ if ss.file_bytes:
                         "fills columns that existed on its source tab. Use Alias groups "
                         "in the sidebar to merge equivalent labels."))
 
-        st.subheader("Option A — Edit inline (Streamlit)")
+        sats = meta.get("satellite_labels", [])
+        if sats:
+            st.caption(
+                "Detected satellite columns (repeating labels attached to the column "
+                f"on their left): **{', '.join(s.title() for s in sats)}**."
+            )
+
+        head_l, head_r = st.columns([3, 1], vertical_alignment="bottom")
+        with head_l:
+            st.subheader("Multi-Tab Data Consolidation")
+        with head_r:
+            st.download_button(
+                "Download Consolidated file",
+                data=df_to_xlsx_bytes(ss.orig_df),
+                file_name=ss.file_name.rsplit(".", 1)[0] + "_Consolidated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Download to edit in Excel. Do NOT add/rename/reorder columns or add/remove rows.",
+            )
         st.caption(
-            "Do not add or delete rows/columns — the Merge step will BLOCK if the shape changes. "
-            "Empty cells stay empty in the source (never overwrite existing values)."
+            "Click any cell to change its value. **Empty cell = leave source unchanged.** "
+            "Do not add or delete rows/columns — the Merge and Write Back steps will BLOCK if the shape changes."
         )
         ss.edited_df = st.data_editor(
             ss.edited_df,
@@ -542,24 +787,17 @@ if ss.file_bytes:
             key="editor",
         )
 
-        st.subheader("Option B — Edit in Excel (download → edit → re-upload)")
-        col_dl, col_ul = st.columns(2)
-        with col_dl:
-            st.download_button(
-                "⬇️ Download Consolidated file",
-                data=df_to_xlsx_bytes(ss.orig_df),
-                file_name=ss.file_name.rsplit(".", 1)[0] + "_Consolidated.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                help="Edit in Excel. Do NOT add/rename/reorder columns or add/remove rows.",
-            )
-        with col_ul:
-            edited_upload = st.file_uploader(
-                "⬆️ Upload edited Consolidated file",
-                type=["xlsx"],
-                key="edited_upload",
-                help="After editing in Excel, upload the file here. Merge will use these values.",
-            )
+        st.subheader("Post Consolidation Update Upload")
+        st.caption(
+            "Download the file using the button above, edit it in Excel, then upload it back here. "
+            "**Do not rename, add, remove or reorder columns or rows** in Excel — only change cell values."
+        )
+        edited_upload = st.file_uploader(
+            "Upload edited Consolidated file",
+            type=["xlsx"],
+            key="edited_upload",
+            help="After editing in Excel, upload the file here. Merge will use these values.",
+        )
         if edited_upload is not None:
             new_df, err = read_edited_consolidated(edited_upload.getvalue(),
                                                     list(ss.orig_df.columns))
@@ -592,7 +830,18 @@ if ss.file_bytes:
             ss.committed = False
 
     if ss.planned is not None:
-        st.subheader("Dry run — nothing has been written yet")
+        st.subheader("Dry-run result — nothing has been written yet")
+        with st.expander("What do these statuses mean?"):
+            st.markdown("""
+| Status | Meaning |
+|---|---|
+| `WILL WRITE` | Value will be written to the source cell when you click Write Back. |
+| `ORPHAN` | You typed a value in a column that doesn't exist on this row's source tab. **Move it to the correct column on the consolidated view.** Nothing is written. |
+| `SKIP (blank = keep)` | The consolidated cell is empty — source is left alone. |
+| `SKIP (match — already equal)` | The source already contains this value — no work to do. |
+| `SKIP (formula)` | Source cell contains a formula — never overwritten. |
+| `SKIP (protected)` | Source sheet is protected — tick *Ignore sheet protection* in the sidebar Advanced section to write anyway. |
+""")
         if ss.planned.empty:
             st.info("No edits detected in the consolidated view.")
         else:
@@ -605,7 +854,7 @@ if ss.file_bytes:
             m3.metric("ORPHAN (blocked)", orph)
             if orph:
                 st.warning(
-                    f"⚠ {orph} edit(s) landed in a column that does not exist on the source tab for that row. "
+                    f"{orph} edit(s) landed in a column that does not exist on the source tab for that row. "
                     "These are the classic \"value in the wrong column\" cases — fix them on the Consolidated view "
                     "before Write Back. Nothing is silently dropped: every ORPHAN is listed below."
                 )
@@ -640,18 +889,21 @@ if ss.file_bytes:
                 ss.committed = True
 
     if ss.committed:
-        st.success("Write Back complete — download the updated workbook below.")
+        st.subheader("Write Back complete")
+        st.success(
+            "Your changes have been applied to a copy of the workbook. Changed cells are highlighted **yellow** in every source tab."
+        )
         st.write("**Write summary:**", ss.audit["Status"].value_counts().to_dict())
         ext = ".xlsm" if ss.file_name.lower().endswith(".xlsm") else ".xlsx"
         st.download_button(
-            "⬇️ Download UPDATED workbook",
+            "Download UPDATED workbook",
             data=ss.output_bytes,
             file_name=ss.file_name.rsplit(".", 1)[0] + f"_Updated_{ss.run_id}" + ext,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
         st.download_button(
-            "⬇️ Download audit log (CSV)",
+            "Download audit log (CSV)",
             data=ss.audit.to_csv(index=False).encode("utf-8"),
             file_name=f"AuditLog_{ss.run_id}.csv",
             mime="text/csv",
@@ -672,4 +924,4 @@ if ss.file_bytes:
                 use_container_width=True,
             )
 else:
-    st.info("👆 Upload an .xlsx file to get started.")
+    st.info("Upload an .xlsx file to get started.")
