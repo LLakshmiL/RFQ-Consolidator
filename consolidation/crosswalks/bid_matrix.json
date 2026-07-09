@@ -1,6 +1,0 @@
-{
-  "record_id": { "aliases": [""] },
-  "service_package": { "aliases": ["Service package"] },
-  "row_description": { "aliases": ["Zeilenbeschreibung / Spaltenbeschreibung"] },
-  "field_description": { "aliases": ["Field description"] }
-}
