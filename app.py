@@ -40,9 +40,43 @@ from openpyxl.utils import get_column_letter
 # Merge headers that differ only by a leading numeric outline (4.19 / 4.20).
 STRIP_NUMBER_PREFIX = True
 
-# Drop satellite columns (Quantity, Currency, …) that are blank/zero across
-# every row. Kept OFF so every satellite column is preserved in the output.
-DROP_EMPTY_QUANTITY = False
+# Drop satellite columns (Quantity, Currency, …) that are blank across every
+# row. The source templates pair a satellite with EVERY descriptive field —
+# even meaningless ones (e.g. a Quantity after "contact person") — so an empty
+# satellite is noise the template injected, not real data. Kept ON so a
+# qualified satellite survives only when it actually carries a value; empty
+# ones are never shown or fabricated.
+DROP_EMPTY_QUANTITY = True
+
+# Satellite/qualifier suffix vocabulary. A header whose (number-stripped,
+# casefolded) label is one of these has no standalone meaning — it qualifies
+# the descriptive column to its left and is renamed "<descriptive header> —
+# <suffix>" (e.g. "Main Carriage — Quantity"). This is a FIXED vocabulary, not
+# a guess based on how often a label repeats, so descriptive headers that
+# happen to recur are never mistaken for satellites. Add domain suffixes here.
+SATELLITE_SUFFIXES = {
+    "quantity", "qty",
+    "currency", "ccy",
+    "amount", "price", "rate", "value",
+    "date",
+    "id",
+    "uom", "unit",
+    "mode",
+}
+
+# Keyword roots that mark a descriptive column as a METRIC/COST parent (a rate,
+# a charge, a fee line, …). A blank satellite (Currency, Quantity, …) sitting
+# next to such a parent is legitimate structure — an empty slot in a tender
+# template awaiting a value — so it is kept even when the whole column is
+# blank. A blank satellite next to a plain text field (contact person, e-mail,
+# address) is template padding and is dropped. Matched as SUBSTRINGS of the
+# parent's normalized name, so a root also covers its variants/plurals
+# (e.g. "charge" covers "charges", "surcharge", "surcharges").
+METRIC_PARENT_KEYWORDS = {
+    "rate", "cost", "fee", "charge", "price", "amount", "value",
+    "carriage", "freight", "tariff", "demurrage", "detention",
+    "total", "volume", "cbm", "weight", "qty", "quantity",
+}
 
 # Sheet-name prefixes to skip (hidden helper sheets like 'Formulas_…').
 SKIP_SHEET_PREFIXES = ["formulas_"]
@@ -54,9 +88,12 @@ ALIAS_GROUPS = [
     # ["4.20 E-Mail address", "4.19 E-Mail address", "4.18 E-Mail address"],
 ]
 
-# Write to cells on protected sheets. The tender template protects the
-# region tabs, so this must be True for edits to actually land.
-IGNORE_PROTECTION = True
+# Respect worksheet protection: locked cells on a protected sheet are NEVER
+# written — they are reported as SKIP (protected) instead. The tender template
+# protects its region tabs and locks the read-only cells (the greyed ones),
+# while leaving the input cells unlocked; edits land only in those unlocked
+# cells. Set to True ONLY if you own the workbook and want to override locks.
+IGNORE_PROTECTION = False
 # ========================================================
 
 
@@ -133,28 +170,33 @@ def detect_header_row(ws, scan_rows: int = 40) -> int:
     return best_row
 
 
-def detect_satellite_labels(wb, skip_prefixes, min_repeat: int = 2) -> set:
-    """Return the set of satellite labels for a workbook.
+def detect_satellite_labels(wb, skip_prefixes) -> set:
+    """Return the set of satellite suffix labels present in the workbook.
 
-    A satellite is any header label that repeats within a sheet's header row
-    (e.g. 'Quantity' after every cost line, 'Currency' after every rate).
-    Such a column has no standalone meaning — it qualifies the column to its
-    left. Detection is global: a label that repeats on ANY sheet is treated
-    as a satellite on EVERY sheet, so a lone occurrence on one tab is still
-    qualified consistently instead of colliding with a real column elsewhere.
+    A satellite is any header whose (number-stripped, casefolded) label is in
+    the fixed SATELLITE_SUFFIXES vocabulary (Quantity, Currency, Amount, …).
+    Such a column has no standalone meaning — it qualifies the descriptive
+    column to its left. Using a fixed vocabulary instead of guessing from how
+    often a label repeats means descriptive headers are never mistaken for
+    satellites, so the "<descriptive header> — Quantity" suffix only ever
+    attaches to genuine metric columns.
+
+    Only suffixes actually seen in the workbook are returned, keeping the
+    reported satellite list meaningful.
     """
-    satellites = set()
+    present = set()
     for name in wb.sheetnames:
         if any(name.lower().startswith(p) for p in skip_prefixes):
             continue
         ws = wb[name]
         hdr = detect_header_row(ws)
-        keys = [_satellite_key(c.value) for c in ws[hdr]
-                if c.value is not None and str(c.value).strip()]
-        for key, count in Counter(keys).items():
-            if key and count >= min_repeat:
-                satellites.add(key)
-    return satellites
+        for c in ws[hdr]:
+            if c.value is None or not str(c.value).strip():
+                continue
+            key = _satellite_key(c.value)
+            if key in SATELLITE_SUFFIXES:
+                present.add(key)
+    return present
 
 
 def read_sheet_with_coords(ws, aliases: dict, strip_prefix: bool = False,
@@ -224,17 +266,48 @@ def read_sheet_with_coords(ws, aliases: dict, strip_prefix: bool = False,
 # ---------------- Consolidation ----------------
 
 def _is_empty_satellite(v) -> bool:
-    """A satellite cell (Quantity, Currency, …) counts as empty when blank
-    or zero."""
+    """A satellite cell (Quantity, Currency, …) counts as empty ONLY when
+    blank. A literal 0 is a real value present in the source, so it is kept —
+    we never discard a value the source actually contains."""
     if v is None:
         return True
     s = str(v).strip()
-    if s == "" or s.lower() == "none":
-        return True
+    return s == "" or s.lower() == "none"
+
+
+def _is_number(v) -> bool:
+    """True if v is a number or a numeric-looking string (ignoring thousands
+    separators / currency symbols is intentionally NOT done here — a parent
+    like a rate holds plain numbers)."""
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return False
+    if isinstance(v, bool):
+        return False
     try:
-        return float(s) == 0.0
+        float(str(v).strip())
+        return True
     except (TypeError, ValueError):
         return False
+
+
+def _column_has_numeric_data(series) -> bool:
+    """A column is 'numeric' (a metric/amount parent like a rate) if any of its
+    values is a number. Text columns (names, e-mails, descriptions) are not."""
+    return any(_is_number(v) for v in series)
+
+
+def _is_metric_parent(col_name: str, series) -> bool:
+    """A satellite's parent qualifies as a metric/cost column — meaning a blank
+    satellite beside it is a real (empty) slot, not template padding — if its
+    NAME contains a metric keyword (rate, charge, fee, carriage, …) OR it holds
+    any numeric data. Name-based detection is what makes this work on blank
+    tender templates, where the rate columns have no values filled in yet.
+    Keywords are matched as substrings so plurals/variants are covered
+    ("charge" also matches "Special Surcharges")."""
+    name = norm(col_name, strip_prefix=True)
+    if any(kw in name for kw in METRIC_PARENT_KEYWORDS):
+        return True
+    return _column_has_numeric_data(series)
 
 
 def consolidate(file_bytes: bytes, skip_prefixes: list, aliases: dict,
@@ -312,18 +385,29 @@ def consolidate(file_bytes: bytes, skip_prefixes: list, aliases: dict,
     df = pd.DataFrame(data_records, columns=cols)
     coords = pd.DataFrame(coord_records, columns=cols)
 
-    # Drop satellite columns (Quantity, Currency, …) that have no real data
-    # anywhere. The source templates pair a satellite with every descriptive
-    # field, even ones where it is meaningless (e.g. a Quantity after an
-    # E-Mail address). Keeping empty satellites just clutters the view;
-    # dropping them is safe because there is nothing to write back for a
-    # column that was never populated.
+    # Drop satellite columns (Quantity, Currency, …) that the template padded
+    # onto a NON-metric field and that carry no data. The source templates
+    # pair a satellite with every descriptive field, even ones where it is
+    # meaningless (e.g. a Quantity after "contact person" or an e-mail). Such
+    # a satellite is noise: drop it. But a blank satellite next to a NUMERIC
+    # parent (e.g. Currency after "Pre-carriage rate") is legitimate structure
+    # — a slot awaiting a value — so it is preserved even when empty. We walk
+    # columns left to right, remembering the nearest preceding descriptive
+    # (non-satellite) column as each satellite's parent.
     dropped_empty_qty = []
     if drop_empty_quantity:
+        parent_col = None
         for col in display_cols:
-            if SAT_SEP not in col:  # only satellites carry the separator
+            if SAT_SEP not in col:  # descriptive column — becomes the parent
+                parent_col = col
                 continue
-            if all(_is_empty_satellite(v) for v in df[col]):
+            if not all(_is_empty_satellite(v) for v in df[col]):
+                continue  # satellite has data — always keep
+            parent_is_metric = (
+                parent_col is not None
+                and _is_metric_parent(parent_col, df[parent_col])
+            )
+            if not parent_is_metric:
                 dropped_empty_qty.append(col)
         if dropped_empty_qty:
             df = df.drop(columns=dropped_empty_qty)
@@ -468,7 +552,6 @@ def apply_planned(wb, planned: pd.DataFrame, ignore_protection: bool) -> pd.Data
             continue
         cell = wb[sheet_name][cell_addr]
         cell.value = row["New value"]
-        cell.fill = YELLOW
         out.at[i, "Status"] = "WRITTEN"
     return out
 
